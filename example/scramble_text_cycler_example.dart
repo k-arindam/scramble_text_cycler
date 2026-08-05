@@ -37,6 +37,7 @@ class _DemoPage extends StatelessWidget {
                 displayDuration: const Duration(milliseconds: 1200),
                 scrambleDuration: const Duration(milliseconds: 600),
                 scrambleTickInterval: const Duration(milliseconds: 40),
+                scrambleCurve: Curves.easeInOut,
                 textStyle: const TextStyle(
                   fontFamily: 'monospace',
                   fontSize: 38,

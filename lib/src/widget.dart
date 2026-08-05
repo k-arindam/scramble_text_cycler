@@ -15,8 +15,9 @@ const _kDefaultScrambleChars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuv
 ///
 /// ### Sequence per word
 /// 1. **Hold** — displays the current word for [displayDuration].
-/// 2. **Scramble** — random characters flash at [scrambleTickInterval]
-///    intervals for [scrambleDuration]; characters settle left-to-right.
+/// 2. **Scramble** — random characters flash in sync with the display's refresh
+///    rate for [scrambleDuration]; characters settle left-to-right following the
+///    [scrambleCurve] easing function.
 /// 3. Snaps to the next word and repeats in a loop.
 ///
 /// ### Multi-line strings
@@ -64,6 +65,11 @@ class ScrambleTextCycler extends StatefulWidget {
 
   /// How frequently the scramble characters update.
   /// Lower = faster chaos. Defaults to 45 ms.
+  ///
+  /// **Note**: The animation is driven by the display's vsync signal for
+  /// smoothness. This interval controls *visual randomisation cadence* —
+  /// the scramble glyphs change at most once per [scrambleTickInterval]
+  /// rather than every single frame, which preserves the staccato aesthetic.
   final Duration scrambleTickInterval;
 
   /// Characters used during the scramble phase.
@@ -81,6 +87,15 @@ class ScrambleTextCycler extends StatefulWidget {
   /// and no clamping is needed.
   final int? maxLines;
 
+  /// Easing curve applied to the character lock-in progression.
+  ///
+  /// Characters settle left-to-right following this curve, so an
+  /// ease-in-out curve causes them to settle slowly at first, accelerate
+  /// through the middle, and decelerate at the end — which looks natural.
+  ///
+  /// Defaults to [Curves.easeInOut].
+  final Curve scrambleCurve;
+
   /// Text style applied to the displayed text.
   /// Falls back to a monospace 24 sp style if not provided.
   final TextStyle? textStyle;
@@ -93,6 +108,7 @@ class ScrambleTextCycler extends StatefulWidget {
     this.scrambleTickInterval = const Duration(milliseconds: 45),
     this.scrambleChars = _kDefaultScrambleChars,
     this.maxLines,
+    this.scrambleCurve = Curves.easeInOut,
     this.textStyle,
   });
 
@@ -100,21 +116,39 @@ class ScrambleTextCycler extends StatefulWidget {
   State<ScrambleTextCycler> createState() => _ScrambleTextCyclerState();
 }
 
-class _ScrambleTextCyclerState extends State<ScrambleTextCycler> {
+class _ScrambleTextCyclerState extends State<ScrambleTextCycler>
+    with SingleTickerProviderStateMixin {
   final _rng = Random();
 
   int _currentIndex = 0;
   String _displayText = '';
 
+  // ── Animation machinery ──────────────────────────────────────────────────
+  late final AnimationController _controller;
   Timer? _holdTimer;
-  Timer? _scrambleTimer;
+
+  // ── Per-scramble state (set once in _beginScramble, reused every frame) ──
+  String _scrambleSource = ''; // normalised old word (the word we're leaving)
+  String _scrambleTarget = ''; // normalised new word (the word we're going to)
+  List<int> _scramblable = const []; // indices into _paddedTarget that may scramble
+  late List<int> _buffer; // mutable codeunit buffer, reused across frames
+  String _paddedTarget = ''; // target padded to max-width with spaces
+  int _paddedLength = 0; // length of the padded target
+
+  // Throttle: track the last tick time so we only regenerate random glyphs
+  // at the user-specified cadence, not every vsync frame.
+  Duration _lastTickElapsed = Duration.zero;
 
   @override
   void initState() {
     super.initState();
+    _controller = AnimationController(vsync: this);
+    _controller.addListener(_onFrame);
+    _controller.addStatusListener(_onAnimationStatus);
+
     if (widget.words.isEmpty) return;
     _displayText = _maybeNormalize(widget.words.first);
-    _scheduleTransition();
+    _scheduleHold();
   }
 
   @override
@@ -123,11 +157,11 @@ class _ScrambleTextCyclerState extends State<ScrambleTextCycler> {
     // If the word list or maxLines changes externally, reset cleanly.
     if (old.words != widget.words || old.maxLines != widget.maxLines) {
       _holdTimer?.cancel();
-      _scrambleTimer?.cancel();
+      _controller.stop();
       _currentIndex = 0;
       if (widget.words.isNotEmpty) {
         setState(() => _displayText = _maybeNormalize(widget.words.first));
-        _scheduleTransition();
+        _scheduleHold();
       }
     }
   }
@@ -135,7 +169,7 @@ class _ScrambleTextCyclerState extends State<ScrambleTextCycler> {
   @override
   void dispose() {
     _holdTimer?.cancel();
-    _scrambleTimer?.cancel();
+    _controller.dispose();
     super.dispose();
   }
 
@@ -166,12 +200,11 @@ class _ScrambleTextCyclerState extends State<ScrambleTextCycler> {
   // ── Timing helpers ──────────────────────────────────────────────────────────
 
   /// Waits [displayDuration], then starts the scramble phase.
-  void _scheduleTransition() {
+  void _scheduleHold() {
     _holdTimer = Timer(widget.displayDuration, _beginScramble);
   }
 
-  /// Animates a character-by-character scramble toward the next word,
-  /// then schedules the next transition.
+  /// Sets up the per-scramble state and kicks off the [AnimationController].
   ///
   /// ### Multi-line handling
   /// Newline characters (`\n`) in the target are **structural**, not content —
@@ -181,62 +214,135 @@ class _ScrambleTextCyclerState extends State<ScrambleTextCycler> {
   /// lock-in counter over that list only. Newline codepoints pass through
   /// unchanged on every tick, so the layout is perfectly stable throughout
   /// the transition regardless of how many lines the target string has.
+  ///
+  /// ### Width-stable transitions
+  /// When the source and target have different lengths, the shorter one is
+  /// space-padded to match the longer. This prevents an abrupt width jump on
+  /// the first frame. As the animation progresses, trailing spaces that exceed
+  /// the target length lock in and are trimmed on the final frame when the
+  /// display snaps to the exact target string.
   void _beginScramble() {
+    if (!mounted || widget.words.isEmpty) return;
+
     final nextIndex = (_currentIndex + 1) % widget.words.length;
-    // Normalise BEFORE computing scramblable indices so that padded \n
-    // positions are already baked into `target` and excluded from scrambling.
-    final target = _maybeNormalize(widget.words[nextIndex]);
-    final pool = widget.scrambleChars;
+    _scrambleSource = _maybeNormalize(widget.words[_currentIndex]);
+    _scrambleTarget = _maybeNormalize(widget.words[nextIndex]);
+
+    // ── Width-stable padding ──────────────────────────────────────────────
+    // Pad the shorter string (on each line) so both occupy the same width.
+    _paddedTarget = _padToMatch(_scrambleTarget, _scrambleSource);
+    final paddedSource = _padToMatch(_scrambleSource, _scrambleTarget);
+    _paddedLength = _paddedTarget.length;
 
     // Build the ordered list of indices that may be scrambled.
     // \n positions are intentionally excluded — they will always emit their
     // real codepoint, keeping the line structure intact from tick 1.
-    final scramblable = <int>[
-      for (int i = 0; i < target.length; i++)
-        if (target[i] != '\n') i,
+    _scramblable = <int>[
+      for (int i = 0; i < _paddedLength; i++)
+        if (_paddedTarget[i] != '\n' && (i < paddedSource.length ? paddedSource[i] != '\n' : true)) i,
     ];
-    final totalScramblable = scramblable.length;
 
-    int tick = 0;
-    final totalTicks = (widget.scrambleDuration.inMilliseconds / widget.scrambleTickInterval.inMilliseconds)
-        .ceil()
-        .clamp(1, 9999);
+    // Pre-allocate the mutable buffer once. We'll mutate it in-place on each
+    // frame instead of allocating a new List<int> every vsync.
+    _buffer = paddedSource.codeUnits.toList();
 
-    _scrambleTimer = Timer.periodic(widget.scrambleTickInterval, (timer) {
-      tick++;
+    // Reset throttle state.
+    _lastTickElapsed = Duration.zero;
 
-      // ── Final tick: snap to the normalised word and start the next cycle ──
-      if (tick >= totalTicks) {
-        timer.cancel();
-        if (!mounted) return;
-        setState(() {
-          _displayText = target; // already normalised above
-          _currentIndex = nextIndex;
-        });
-        _scheduleTransition();
-        return;
+    // Configure and start the animation controller.
+    _controller.duration = widget.scrambleDuration;
+    _controller.forward(from: 0.0);
+  }
+
+  // ── Per-frame update (vsync-driven) ─────────────────────────────────────────
+
+  /// Called on every vsync frame while the [AnimationController] is running.
+  ///
+  /// The scramble glyphs are only regenerated when enough time has elapsed
+  /// since the last regeneration (governed by [scrambleTickInterval]). On
+  /// in-between frames we still call [setState] with the latest lock-in count
+  /// so the progression stays silky-smooth, but the random characters hold
+  /// steady, preserving the staccato "hacker terminal" aesthetic.
+  void _onFrame() {
+    if (!mounted) return;
+
+    final pool = widget.scrambleChars;
+    final totalScramblable = _scramblable.length;
+
+    // Apply easing curve to the raw linear progress.
+    final double curvedProgress = widget.scrambleCurve.transform(_controller.value);
+    final int lockedCount = (curvedProgress * totalScramblable).floor();
+
+    // Determine whether we should regenerate random glyphs this frame.
+    final elapsed = _controller.lastElapsedDuration ?? Duration.zero;
+    final shouldRegenerateRandoms =
+        (elapsed - _lastTickElapsed) >= widget.scrambleTickInterval;
+    if (shouldRegenerateRandoms) {
+      _lastTickElapsed = elapsed;
+    }
+
+    // ── Fill the buffer ────────────────────────────────────────────────────
+    // Locked positions  → target character
+    // Unlocked positions → random glyph (only regenerated on tick boundaries)
+    // \n positions       → always '\n'
+    for (int si = 0; si < totalScramblable; si++) {
+      final idx = _scramblable[si];
+      if (si < lockedCount) {
+        // Locked: emit the target character (or space if beyond target length).
+        _buffer[idx] = idx < _paddedLength
+            ? _paddedTarget.codeUnitAt(idx)
+            : 0x20; // space
+      } else if (shouldRegenerateRandoms) {
+        // Still chaotic: emit a fresh random character.
+        _buffer[idx] = pool.codeUnitAt(_rng.nextInt(pool.length));
       }
+      // else: keep the previous random glyph (no-op, buffer already holds it)
+    }
 
-      // ── Intermediate ticks ──────────────────────────────────────────────
-      //
-      // `lockedCount` grows from 0 → totalScramblable over the animation.
-      // scramblable[0..lockedCount-1] → settled (emit target char)
-      // scramblable[lockedCount..]    → still chaotic (emit random char)
-      // any \n index                  → always emit '\n'
-      final double progress = tick / totalTicks;
-      final int lockedCount = (progress * totalScramblable).floor();
+    setState(() => _displayText = String.fromCharCodes(_buffer));
+  }
 
-      // Start from a mutable copy of the target's codepoints.
-      // \n positions are already correct; we only overwrite the unscrambled
-      // non-newline positions with random chars from the pool.
-      final codes = target.codeUnits.toList();
-      for (int si = lockedCount; si < totalScramblable; si++) {
-        codes[scramblable[si]] = pool.codeUnitAt(_rng.nextInt(pool.length));
-      }
+  /// Called when the [AnimationController] completes (reaches 1.0).
+  void _onAnimationStatus(AnimationStatus status) {
+    if (status != AnimationStatus.completed) return;
+    if (!mounted) return;
 
-      if (!mounted) return;
-      setState(() => _displayText = String.fromCharCodes(codes));
+    final nextIndex = (_currentIndex + 1) % widget.words.length;
+    setState(() {
+      // Snap to the exact target string — no padding, no scramble artifacts.
+      _displayText = _scrambleTarget;
+      _currentIndex = nextIndex;
     });
+    _scheduleHold();
+  }
+
+  // ── Width-stable padding helper ──────────────────────────────────────────────
+
+  /// Pads [text] with trailing spaces on each line so it is at least as wide
+  /// as the corresponding line in [reference].
+  ///
+  /// For single-line strings this simply pads to `max(text.length, ref.length)`.
+  /// For multi-line strings each line is padded independently, so per-line
+  /// widths stay stable even when individual lines differ in length.
+  static String _padToMatch(String text, String reference) {
+    final textLines = text.split('\n');
+    final refLines = reference.split('\n');
+
+    // Fast path: single-line strings.
+    if (textLines.length == 1 && refLines.length == 1) {
+      final maxLen = max(text.length, reference.length);
+      return text.padRight(maxLen);
+    }
+
+    final maxLineCount = max(textLines.length, refLines.length);
+    final buf = StringBuffer();
+    for (int i = 0; i < maxLineCount; i++) {
+      if (i > 0) buf.write('\n');
+      final tLine = i < textLines.length ? textLines[i] : '';
+      final rLine = i < refLines.length ? refLines[i] : '';
+      buf.write(tLine.padRight(max(tLine.length, rLine.length)));
+    }
+    return buf.toString();
   }
 
   // ── Build ───────────────────────────────────────────────────────────────────
